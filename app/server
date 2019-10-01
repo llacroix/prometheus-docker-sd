@@ -1,0 +1,169 @@
+#!/usr/bin/env python3
+from flask import Flask
+from flask_restful import Resource, Api
+import docker
+
+app = Flask(__name__)
+api = Api(app)
+
+class Apps(Resource):
+
+    def load_tasks(self, service):
+        tasks = service.tasks()
+        task_out = []
+        for task in tasks:
+            print(task)
+            addresses = []
+            for addr1 in task['NetworksAttachments']: 
+                for addr in addr1['Addresses']:
+                    addresses.append({
+                        "ipAddress": addr.split('/')[0],
+                        "protocol": addr.split('/')[1]
+                    })
+
+            if 'Hostname' in task['Spec']['ContainerSpec']:
+                #new_task = {
+                #    "id": task['ID'],
+                #    "host": task['Spec']['ContainerSpec']['Hostname'] 
+                #    "ports": [cc['servicePort'] for cc in self.load_ports(service)],
+                #    "ipAddresses": addresses,
+                #}
+                pass
+            new_task = {
+                "id": task['ID'],
+                "host": service.attrs['Spec']['Name'],
+                "ports": [cc['servicePort'] for cc in self.load_ports(service)],
+                "ipAddresses": addresses,
+            }
+
+            task_out.append(new_task)
+
+        return task_out
+
+    def load_labels(self, service):
+        return service.attrs['Spec']['Labels'] 
+
+    def load_docker(self, service):
+        return {
+            "image": service.attrs['Spec']['TaskTemplate']['ContainerSpec']['Image'],
+            "portMappings": self.load_ports(service)
+        }
+
+    def load_networks(self, service):
+        client = docker.from_env()
+        networks = service.attrs['Spec']['TaskTemplate']['Networks']
+        specs = []
+        for network in networks:
+            found = client.networks.get(network['Target'])
+            specs.append({
+                "name": found.attrs['Name'],
+                "mode": found.attrs['Scope']
+            })
+        return specs
+
+    def load_container(self, service):
+        return {
+            "docker": self.load_docker(service),
+            "portMappings": self.load_ports(service)
+        }
+
+    def load_expose(self, service):
+        client = docker.from_env()
+        image_id = service.attrs['Spec']['TaskTemplate']['ContainerSpec']['Image']
+        image = client.images.get(image_id)
+
+        if not 'ExposedPorts' in image.attrs['ContainerConfig']:
+            return []
+
+        ports = image.attrs['ContainerConfig']['ExposedPorts']
+        
+        found = []
+        for key, value in ports.items():
+            port, proto = key.split('/')
+
+            found.append({
+                "labels": {},
+                "port": int(port)
+            })
+        return found
+
+    def load_ports(self, service):
+        if not 'Ports' in service.attrs['Endpoint']['Spec']:
+            ports = []
+
+        else:
+            endpoints = service.attrs['Endpoint']['Spec']['Ports']
+
+            ports = [
+                {
+                    "labels": {
+                    },
+                    "servicePort": endp['TargetPort'],
+                    "hostPort": endp['PublishedPort'],
+                    "containerPort": endp['PublishedPort']
+                }
+                for endp in endpoints
+            ]
+
+        labels = self.load_labels(service)
+        port = None
+        metrics_path = "/metrics"
+
+        if 'prometheus.port' in labels:
+            port = int(labels['prometheus.port'])
+
+        if 'prometheus.path' in labels:
+            metrics_path = labels['prometheus.path']
+
+        if port:
+            ports.append({
+                "labels": {
+                    "metrics": metrics_path,
+                },
+                "servicePort": port,
+                "hostPort": port,
+                "containerPort": port
+            })
+
+        return ports
+
+    def service_to_app(self, service):
+        client = docker.from_env()
+
+        tasks = self.load_tasks(service)
+
+        return {
+            "id": service.id,
+            "tasks": tasks,
+            "tasksRunning": service.attrs['Spec']['Mode']['Replicated']['Replicas'],
+            "labels": self.load_labels(service),
+            "container": self.load_container(service),
+            "portDefinitions": self.load_expose(service),
+            "networks": self.load_networks(service),
+            "requirePorts": False
+        }
+
+
+    def load_apps(self):
+        client = docker.from_env()
+
+        services = client.services.list()
+
+        return [
+            self.service_to_app(service)
+            for service in services
+        ]
+
+
+    def get(self):
+
+        apps = self.load_apps()
+
+        return {
+            "apps": apps
+        }
+
+#api.add_resource(Apps, '/v2/apps')
+api.add_resource(Apps, '/v2/apps/')
+
+app.run(host='0.0.0.0')
